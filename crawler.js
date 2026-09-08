@@ -1,38 +1,76 @@
 const axios = require('axios');
 const fs = require('fs');
 const path = require('path');
+const https = require('https');
+const dns = require('dns');
 
-const VERSION = 'HCC_TTHC_CRAWLER_1.0.0';
+const VERSION = 'HCC_TTHC_CRAWLER_1.1.0';
 const DATA_DIR = path.join(process.cwd(), 'data');
 const DETAILS_DIR = path.join(DATA_DIR, 'details');
 const LIST_URL = 'https://dichvucong.gov.vn/api/v1/submitting/formality/list-all-public-formality-by-citizen';
 const DETAIL_URL = 'https://dichvucong.gov.vn/api/v1/configuring/formality/get-formality-by-citizen';
-const PAGE_LIMIT = 200;
-const DETAIL_CHUNK = 20;
+const PAGE_LIMITS = [200, 100, 50, 20];
+const DETAIL_CHUNK = 12;
 
+// Ưu tiên IPv4 vì một số runner cloud có tuyến IPv6 tới DVCQG không ổn định.
+try { dns.setDefaultResultOrder('ipv4first'); } catch (_) {}
+const httpsAgent = new https.Agent({
+  keepAlive: true,
+  family: 4,
+  maxSockets: 24,
+  timeout: 65000
+});
+
+// Giữ header gần với crawler tham chiếu đã quan sát được; không gắn UA tùy biến.
 const headers = {
   accept: 'application/json',
-  'content-type': 'application/json',
-  'user-agent': 'HCC-TTHC-Data/1.0 (+public DVCQG catalog sync)'
+  'content-type': 'application/json'
 };
 
 const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
 
-async function postWithRetry(url, payload, maxRetries = 5) {
+function errInfo(err) {
+  return {
+    message: err?.message || String(err),
+    code: err?.code || '',
+    status: err?.response?.status || '',
+    address: err?.address || err?.cause?.address || '',
+    syscall: err?.syscall || err?.cause?.syscall || ''
+  };
+}
+
+async function postWithRetry(url, payload, maxRetries = 3, timeout = 60000) {
   let lastError;
   for (let i = 0; i <= maxRetries; i++) {
     try {
-      const res = await axios.post(url, payload, { headers, timeout: 45000 });
+      const res = await axios.post(url, payload, {
+        headers,
+        timeout,
+        httpsAgent,
+        proxy: false,
+        maxRedirects: 3,
+        validateStatus: s => s >= 200 && s < 300
+      });
       return res.data;
     } catch (err) {
       lastError = err;
+      const info = errInfo(err);
       if (i >= maxRetries) break;
-      const wait = Math.min(30000, 1000 * Math.pow(2, i));
-      console.log(`⚠️ Lỗi gọi API, thử lại ${i + 1}/${maxRetries} sau ${wait}ms: ${err.message}`);
+      const wait = Math.min(16000, 1000 * Math.pow(2, i));
+      console.log(`⚠️ API lỗi ${i + 1}/${maxRetries}; chờ ${wait}ms | code=${info.code || '-'} status=${info.status || '-'} | ${info.message}`);
       await delay(wait);
     }
   }
   throw lastError;
+}
+
+async function logDns() {
+  try {
+    const all = await dns.promises.lookup('dichvucong.gov.vn', { all: true });
+    console.log('🌐 DNS dichvucong.gov.vn:', all.map(x => `${x.address}/IPv${x.family}`).join(', '));
+  } catch (e) {
+    console.log('⚠️ Không đọc được DNS:', e.message);
+  }
 }
 
 function sanitizeBase64(obj) {
@@ -40,11 +78,7 @@ function sanitizeBase64(obj) {
   s = s.replace(/data:image\/[^;]+;base64,[a-zA-Z0-9+/=]+/g, '[Hình ảnh đính kèm trên DVCQG]');
   return JSON.parse(s);
 }
-
-function text(v) {
-  return v == null ? '' : String(v).trim();
-}
-
+function text(v) { return v == null ? '' : String(v).trim(); }
 function parseFormalityType(type) {
   if (type === 'ASSIGNED_REGULATION') return 'TTHC được luật giao quy định chi tiết';
   if (type === 'SPECIFIC') return 'TTHC Đặc thù';
@@ -54,7 +88,6 @@ function parseFormalityType(type) {
   if (type === 'INTERCONNECTED_INTERNAL') return 'TTHC nội bộ liên thông';
   return type || 'Không xác định';
 }
-
 function parseCaseLevel(detail) {
   const levels = [];
   if (detail?.isWard === true) levels.push('Cấp xã');
@@ -63,17 +96,13 @@ function parseCaseLevel(detail) {
   if (detail?.isOtherAgency === true) levels.push('Cơ quan khác');
   return levels.length ? levels.join(', ') : 'Chưa xác định';
 }
-
 function normalizeExecutingAgencies(detail, item) {
   const v = detail?.executingAgencies;
-  if (Array.isArray(v)) {
-    return v.map(x => typeof x === 'string' ? x : (x?.name || x?.agencyName || x?.title || '')).filter(Boolean).join(', ');
-  }
+  if (Array.isArray(v)) return v.map(x => typeof x === 'string' ? x : (x?.name || x?.agencyName || x?.title || '')).filter(Boolean).join(', ');
   if (typeof v === 'string') return v;
   if (Array.isArray(item?.departments)) return item.departments.join(', ');
   return '';
 }
-
 function qualityState(item, detail) {
   if (!item || !detail) return 'INVALID';
   const missing = [];
@@ -86,33 +115,45 @@ function qualityState(item, detail) {
 }
 
 async function fetchCatalog() {
-  const items = [];
-  let lastId = '';
-  let page = 0;
-  while (true) {
-    page++;
-    const payload = { limit: PAGE_LIMIT, lastId, q: '', categoryId: '', departmentCode: '' };
-    const res = await postWithRetry(LIST_URL, payload);
-    const batch = res?.data?.items;
-    if (!Array.isArray(batch) || batch.length === 0) break;
-    items.push(...batch);
-    console.log(`📚 Trang ${page}: +${batch.length}, tổng ${items.length}`);
-    const next = text(res?.data?.lastId);
-    if (!next || next === lastId) break;
-    lastId = next;
-    await delay(120);
+  let lastFailure;
+  for (const pageLimit of PAGE_LIMITS) {
+    const items = [];
+    let lastId = '';
+    let page = 0;
+    console.log(`🔎 Thử lấy danh mục với limit=${pageLimit}...`);
+    try {
+      while (true) {
+        page++;
+        const payload = { limit: pageLimit, lastId, q: '', categoryId: '', departmentCode: '' };
+        const res = await postWithRetry(LIST_URL, payload, 2, 45000);
+        const batch = res?.data?.items;
+        if (!Array.isArray(batch) || batch.length === 0) break;
+        items.push(...batch);
+        console.log(`📚 limit=${pageLimit} | trang ${page}: +${batch.length}, tổng ${items.length}`);
+        const next = text(res?.data?.lastId);
+        if (!next || next === lastId) break;
+        lastId = next;
+        await delay(150);
+      }
+      if (items.length) return items;
+      throw new Error('API trả danh mục rỗng');
+    } catch (e) {
+      lastFailure = e;
+      console.log(`⚠️ limit=${pageLimit} thất bại: ${errInfo(e).message}`);
+      await delay(1500);
+    }
   }
-  return items;
+  throw lastFailure || new Error('Không lấy được danh mục DVCQG');
 }
 
 async function main() {
   console.log(`=== ${VERSION} ===`);
+  await logDns();
   if (fs.existsSync(DATA_DIR)) fs.rmSync(DATA_DIR, { recursive: true, force: true });
   fs.mkdirSync(DETAILS_DIR, { recursive: true });
 
   const rawList = await fetchCatalog();
   console.log(`✅ Tổng danh mục: ${rawList.length}`);
-
   const index = [];
   const errors = [];
 
@@ -120,13 +161,11 @@ async function main() {
     const chunk = rawList.slice(i, i + DETAIL_CHUNK);
     const results = await Promise.all(chunk.map(async item => {
       try {
-        const res = await postWithRetry(DETAIL_URL, { id: item.id });
+        const res = await postWithRetry(DETAIL_URL, { id: item.id }, 3, 45000);
         const detail = res?.data?.data || res?.data;
         if (!detail || typeof detail !== 'object') throw new Error('Không có detail hợp lệ');
-
         const cleanDetail = sanitizeBase64(detail);
         fs.writeFileSync(path.join(DETAILS_DIR, `${item.id}.json`), JSON.stringify(cleanDetail));
-
         return {
           id: item.id,
           ma_tthc: text(item.code),
@@ -138,18 +177,16 @@ async function main() {
           data_state: qualityState(item, detail)
         };
       } catch (err) {
-        errors.push({ id: item?.id, code: item?.code, name: item?.name, error: err.message });
+        errors.push({ id: item?.id, code: item?.code, name: item?.name, ...errInfo(err) });
         return null;
       }
     }));
-
     index.push(...results.filter(Boolean));
     console.log(`⚙️ Chi tiết: ${Math.min(i + DETAIL_CHUNK, rawList.length)}/${rawList.length} | thành công ${index.length} | lỗi ${errors.length}`);
-    await delay(180);
+    await delay(220);
   }
 
   index.sort((a, b) => a.ma_tthc.localeCompare(b.ma_tthc, 'vi'));
-
   const now = new Date().toISOString();
   fs.writeFileSync(path.join(DATA_DIR, 'index.json'), JSON.stringify(index));
   fs.writeFileSync(path.join(DATA_DIR, 'version.json'), JSON.stringify({
@@ -163,7 +200,6 @@ async function main() {
     total_errors: errors.length
   }, null, 2));
   fs.writeFileSync(path.join(DATA_DIR, 'errors.json'), JSON.stringify(errors, null, 2));
-
   console.log(`🎉 Hoàn tất: ${index.length}/${rawList.length}; lỗi ${errors.length}`);
   if (rawList.length === 0 || index.length < Math.max(1, Math.floor(rawList.length * 0.9))) {
     throw new Error('Tỷ lệ dữ liệu thành công quá thấp; không xuất bản kho dữ liệu không đầy đủ.');
