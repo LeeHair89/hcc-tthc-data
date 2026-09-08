@@ -1,0 +1,43 @@
+name: HCC TTHC Daily Sync
+
+on:
+  schedule:
+    # 00:30 giờ Việt Nam = 17:30 UTC ngày hôm trước
+    - cron: '30 17 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: hcc-tthc-daily-sync
+  cancel-in-progress: false
+
+jobs:
+  crawl-and-publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Crawl DVCQG public TTHC data
+        run: npm run crawl
+
+      - name: Publish data branch
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./data
+          publish_branch: data
+          force_orphan: true
+          commit_message: 'HCC: cập nhật dữ liệu TTHC tự động'
